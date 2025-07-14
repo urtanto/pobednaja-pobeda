@@ -1,0 +1,6 @@
+asyncpg
+psycopg[binary]
+sqlalchemy
+sqlalchemy[asyncio]
+aio-pika
+alembic

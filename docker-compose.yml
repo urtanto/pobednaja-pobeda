@@ -10,6 +10,10 @@ services:
       - "54321:5432"
     volumes:
       - pg1_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user1 -d db1" ]
+      interval: 5s
+      retries: 10
 
 
   postgres2:
@@ -23,6 +27,10 @@ services:
       - "54322:5432"
     volumes:
       - pg2_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U user2 -d db2" ]
+      interval: 5s
+      retries: 10
 
 
   rabbitmq:
@@ -36,7 +44,28 @@ services:
       - "15672:15672"
     volumes:
       - rabbit_data:/var/lib/rabbitmq
+    healthcheck:
+      test: [ "CMD-SHELL", "rabbitmqctl status || exit 1" ]
+      interval: 1s
+      timeout: 5s
+      retries: 60
 
+  auth:
+    container_name: auth_service
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    restart: always
+    ports:
+      - "8001:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://user1:pass1@postgres1:5432/db1
+      PYTHONPATH: "${PYTHONPATH}:/app"
+    depends_on:
+      postgres1:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   pg1_data:

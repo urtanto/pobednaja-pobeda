@@ -1,4 +1,4 @@
-import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -7,6 +7,8 @@ from typing import Optional
 
 import jwt
 import uvicorn
+from aio_pika import ExchangeType, Message, connect_robust
+from aio_pika.abc import AbstractExchange, AbstractRobustConnection
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
@@ -24,10 +26,60 @@ ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
+rabbit_host = os.getenv("RABBITMQ_HOST", "localhost")
+rabbit_user = os.getenv("RABBITMQ_USER", "guest")
+rabbit_pass = os.getenv("RABBITMQ_PASS", "guest")
+rabbit_port = int(os.getenv("RABBITMQ_PORT", 5672))
+
+
+async def get_connection() -> AbstractRobustConnection:
+    connection = await connect_robust(
+        host=rabbit_host,
+        port=rabbit_port,
+        login=rabbit_user,
+        password=rabbit_pass
+    )
+    try:
+        yield connection
+    finally:
+        await connection.close()
+
+
+async def get_exchange(name: str, connection: AbstractRobustConnection) -> AbstractExchange:
+    channel = await connection.channel()
+    exchange = await channel.get_exchange(
+        name=name,
+        ensure=True,
+    )
+    return exchange
+
+
+async def auth_exchange(connection: AbstractRobustConnection = Depends(get_connection)) -> AbstractExchange:
+    return await get_exchange(name="event", connection=connection)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await Database().init()
+
+    connection = await connect_robust(
+        host=rabbit_host,
+        port=rabbit_port,
+        login=rabbit_user,
+        password=rabbit_pass
+    )
+
+    async with connection:
+        channel = await connection.channel()
+
+        await channel.declare_exchange(
+            name="event",
+            type=ExchangeType.DIRECT,
+            durable=True
+        )
+
     yield
+
 
 app = FastAPI(title="Unified API", lifespan=lifespan)
 
@@ -102,7 +154,7 @@ async def _get_current_user(token: str = Depends(oauth2_scheme)) -> UserPublic:
 
 
 @app.post("/register", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
-async def register(user: UserCreate):
+async def register(user: UserCreate, exchange: AbstractExchange = Depends(auth_exchange)):
     if await _get_user(user.email):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists")
 
@@ -114,6 +166,20 @@ async def register(user: UserCreate):
             )
             session.add(new_user)
             await session.flush()
+            await exchange.publish(
+                message=Message(
+                    body=json.dumps(
+                        {
+                            "type": "user registered",
+                            "data": {
+                                "email": new_user.email,
+                            }
+                        }
+                    ).encode(),
+                    content_type="application/json",
+                ),
+                routing_key="user.registered",
+            )
 
     return UserPublic(id=new_user.id, email=new_user.email)
 

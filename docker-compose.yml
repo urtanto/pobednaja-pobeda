@@ -1,3 +1,15 @@
+x-rabbit-env: &rabbit-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_USER: guest
+  RABBITMQ_PASS: guest
+  RABBITMQ_PORT: 5672
+
+x-python-env: &python-env
+  PIP_NO_CACHE_DIR: 1
+  PYTHONDONTWRITEBYTECODE: 1
+  PYTHONUNBUFFERED: "1"
+  PYTHONPATH: "${PYTHONPATH}:/app"
+
 services:
   postgres1:
     image: postgres:15
@@ -39,6 +51,7 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_LOGS: "/dev/null"
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -52,18 +65,34 @@ services:
 
   auth:
     container_name: auth_service
+    profiles:
+      - production
     build:
       context: .
       dockerfile: services/auth/Dockerfile
     restart: always
     ports:
-      - "8001:8000"
+      - "8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://user1:pass1@postgres1:5432/db1
-      PYTHONPATH: "${PYTHONPATH}:/app"
+      <<: [*rabbit-env, *python-env]
     depends_on:
       postgres1:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  email:
+    container_name: email_service
+    profiles:
+      - production
+    build:
+      context: .
+      dockerfile: services/email/Dockerfile
+    restart: always
+    environment:
+      <<: [*rabbit-env, *python-env]
+    depends_on:
       rabbitmq:
         condition: service_healthy
 
@@ -71,7 +100,3 @@ volumes:
   pg1_data:
   pg2_data:
   rabbit_data:
-
-networks:
-  backend:
-    driver: bridge

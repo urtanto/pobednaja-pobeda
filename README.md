@@ -23,6 +23,22 @@
 
 ---
 
+# Как запустить
+
+1. DEV запуск:
+
+```bash
+  docker compose up
+```
+
+2. Запуск:
+
+```bash
+  docker compose --profile production up --build
+```
+
+---
+
 # Ебанутые tips and tricks
 
 Новая миграция для сервиса:

@@ -10,6 +10,9 @@ x-python-env: &python-env
   PYTHONUNBUFFERED: "1"
   PYTHONPATH: "${PYTHONPATH}:/app"
 
+x-auth-env: &auth-env
+  SECRET_KEY: "SecretKeyForAuthService"
+
 services:
   postgres1:
     image: postgres:15
@@ -74,8 +77,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg://user1:pass1@postgres1:5432/db1
-      <<: [*rabbit-env, *python-env]
+      DATABASE_URL: postgresql+asyncpg://user1:pass1@postgres1:5432/db1
+      <<: [ *rabbit-env, *python-env, *auth-env ]
     depends_on:
       postgres1:
         condition: service_healthy
@@ -91,8 +94,27 @@ services:
       dockerfile: services/email/Dockerfile
     restart: always
     environment:
-      <<: [*rabbit-env, *python-env]
+      <<: [ *rabbit-env, *python-env, *auth-env ]
     depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  tasks:
+    container_name: tasks_service
+    profiles:
+      - production
+    build:
+      context: .
+      dockerfile: services/task/Dockerfile
+    restart: always
+    ports:
+      - "8001:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://user2:pass2@postgres2:5432/db2
+      <<: [ *rabbit-env, *python-env, *auth-env ]
+    depends_on:
+      postgres2:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
 

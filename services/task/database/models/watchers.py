@@ -3,7 +3,7 @@ import uuid
 from sqlalchemy import ForeignKey, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from services.auth.database.connector import SqlAlchemyBase
+from services.task.database.connector import SqlAlchemyBase
 
 
 class Watcher(SqlAlchemyBase):

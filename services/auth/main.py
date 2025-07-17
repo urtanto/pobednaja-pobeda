@@ -1,19 +1,21 @@
+import asyncio
 import json
 import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Optional
+from typing import Any, AsyncGenerator, Optional
 
 import jwt
 import uvicorn
-from aio_pika import ExchangeType, Message, connect_robust
-from aio_pika.abc import AbstractExchange, AbstractRobustConnection
+from aio_pika import ExchangeType, IncomingMessage, Message, RobustChannel, connect_robust
+from aio_pika.abc import AbstractExchange, AbstractIncomingMessage, AbstractRobustConnection
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
+from starlette.requests import Request
 from starlette.status import HTTP_200_OK
 
 from services.auth.database.connector import Database
@@ -32,17 +34,8 @@ rabbit_pass = os.getenv("RABBITMQ_PASS", "guest")
 rabbit_port = int(os.getenv("RABBITMQ_PORT", 5672))
 
 
-async def get_connection() -> AbstractRobustConnection:
-    connection = await connect_robust(
-        host=rabbit_host,
-        port=rabbit_port,
-        login=rabbit_user,
-        password=rabbit_pass
-    )
-    try:
-        yield connection
-    finally:
-        await connection.close()
+def get_connection(request: Request) -> AbstractRobustConnection:
+    return request.app.state.amqp_connection
 
 
 async def get_exchange(name: str, connection: AbstractRobustConnection) -> AbstractExchange:
@@ -58,6 +51,116 @@ async def auth_exchange(connection: AbstractRobustConnection = Depends(get_conne
     return await get_exchange(name="event", connection=connection)
 
 
+async def rpc_user_get(msg: AbstractIncomingMessage):
+    async with msg.process():
+        body = json.loads(msg.body.decode())
+        user_id = body.get("user_id", None)
+        user_email = body.get("email", None)
+
+        if not user_id and not user_email:
+            res = {
+                "type": "error",
+                "data": {
+                    "error": "User ID or email is required"
+                }
+            }
+        else:
+            async with await Database().get_session() as session:
+                async with session.begin():
+                    if user_id:
+                        user: Users = (
+                            await session.execute(
+                                select(Users).where(Users.id == uuid.UUID(user_id))
+                            )
+                        ).scalar_one_or_none()
+                    else:
+                        user: Users = (
+                            await session.execute(
+                                select(Users).where(Users.email == user_email)
+                            )
+                        ).scalar_one_or_none()
+
+                    if user:
+                        res = {
+                            "type": "success",
+                            "data": {
+                                "id": str(user.id),
+                                "email": user.email,
+                                "password": user.password
+                            }
+                        }
+                    else:
+                        res = {
+                            "type": "error",
+                            "data": {
+                                "error": "User not found"
+                            }
+                        }
+
+        channel = await app.state.amqp_connection.channel()
+
+        await channel.default_exchange.publish(
+            Message(
+                body=json.dumps(res).encode(),
+                correlation_id=msg.correlation_id
+            ),
+            routing_key=msg.reply_to,
+        )
+
+
+async def start_rpc():
+    channel = await app.state.amqp_connection.channel()
+
+    exchange = await channel.declare_exchange(
+        name="rpc",
+        type=ExchangeType.DIRECT,
+        durable=True
+    )
+
+    queue = await channel.declare_queue("user.get", durable=False)
+    await queue.bind(exchange, routing_key="user.get")
+    await queue.consume(rpc_user_get)
+
+    await asyncio.Future()
+
+
+async def rpc_call(routing_key: str, data: dict):
+    corr_id = str(uuid.uuid4())
+
+    channel = await app.state.amqp_connection.channel()
+
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+
+    async def on_response(msg: IncomingMessage) -> None:
+        if msg.correlation_id == corr_id:
+            future.set_result(json.loads(msg.body.decode()))
+
+    reply_q = await channel.get_queue("amq.rabbitmq.reply-to", ensure=False)
+    await reply_q.consume(
+        on_response,
+        no_ack=True,
+    )
+
+    exchange = await channel.declare_exchange(
+        name="rpc",
+        type=ExchangeType.DIRECT,
+        durable=True
+    )
+
+    await exchange.publish(
+        Message(
+            body=json.dumps(data).encode(),
+            reply_to="amq.rabbitmq.reply-to",
+            correlation_id=corr_id,
+        ),
+        routing_key=routing_key,
+    )
+
+    result = await future
+    return result
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await Database().init()
@@ -68,17 +171,21 @@ async def lifespan(app: FastAPI):
         login=rabbit_user,
         password=rabbit_pass
     )
+    app.state.amqp_connection = connection
 
-    async with connection:
-        channel = await connection.channel()
+    channel = await connection.channel()
 
-        await channel.declare_exchange(
-            name="event",
-            type=ExchangeType.DIRECT,
-            durable=True
-        )
+    await channel.declare_exchange(
+        name="event",
+        type=ExchangeType.DIRECT,
+        durable=True
+    )
+
+    asyncio.create_task(start_rpc())
 
     yield
+
+    await connection.close()
 
 
 app = FastAPI(title="Unified API", lifespan=lifespan)
@@ -92,6 +199,10 @@ class UserCreate(BaseModel):
 class UserPublic(BaseModel):
     id: uuid.UUID
     email: EmailStr
+
+class UserInfo(UserPublic):
+    watchers: int = 0
+    executors: int = 0
 
 
 class AuthUserResponse(BaseModel):
@@ -193,9 +304,16 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return AuthUserResponse(access_token=access_token)
 
 
-@app.get("/me", response_model=UserPublic)
+@app.get("/info", response_model=UserInfo)
 async def read_users_me(current_user: UserPublic = Depends(_get_current_user)):
-    return current_user
+    watchers = await rpc_call("tasks.watchers", {"user_id": str(current_user.id)})
+    executors = await rpc_call("tasks.executors", {"user_id": str(current_user.id)})
+    return UserInfo(
+        id=current_user.id,
+        email=current_user.email,
+        watchers=len(watchers["data"]),
+        executors=len(executors["data"])
+    )
 
 
 @app.get("/healthz", tags=["healthz"])

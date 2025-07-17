@@ -5,8 +5,9 @@ from sqlalchemy import Enum, Index, String, UUID, text
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from services.auth.database.connector import SqlAlchemyBase
+from services.task.database.connector import SqlAlchemyBase
 from services.task.enums import Status
+from services.task.schemas import TaskDB
 
 
 class TaskModel(SqlAlchemyBase):
@@ -41,3 +42,30 @@ class TaskModel(SqlAlchemyBase):
         "executor_associations",
         "user_id"
     )
+
+    def to_schema(self) -> TaskDB:
+        try:
+            return TaskDB(
+                id=self.id,
+                title=self.title,
+                description=self.description,
+                status=self.status,
+                author_id=self.author_id,
+                assignee_id=self.assignee_id,
+                watchers=self.watchers,
+                executors=self.executors,
+                created_at=self.created_at
+            )
+        except Exception:
+            return TaskDB(
+                id=self.id,
+                title=self.title,
+                description=self.description,
+                status=self.status,
+                author_id=self.author_id,
+                assignee_id=self.assignee_id,
+                watchers=[],
+                executors=[],
+                created_at=self.created_at
+            )
+

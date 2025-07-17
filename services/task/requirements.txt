@@ -1,2 +1,6 @@
 fastapi
 pyjwt
+passlib[bcrypt]
+python-multipart
+uvicorn[standard]
+pydantic[email]
